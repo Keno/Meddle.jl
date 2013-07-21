@@ -34,9 +34,10 @@ MEDDLE_VERSION = "0.0"
 using HttpServer
 export Midware,
        MeddleRequest,
+       MeddleResponse,
        DefaultHeaders,
        URLDecoder,
-       CookieDecoder,
+       Cookies,
        BodyDecoder,
        FileServer, 
        NotFound, 
@@ -44,11 +45,6 @@ export Midware,
        handle, 
        middleware, 
        respond
-
-immutable MeddleRequest
-    http_req::Request
-    state::Dict
-end
 
 # `Midware` only uses the `handler` right now.
 # Expects & Provides may be leveraged soon to do dependency resolution
@@ -64,15 +60,31 @@ Midware(handler::Function) = Midware(handler,[],[])
 # `MidwareStack` is just an `Array` of `Midware`
 typealias MidwareStack Array{Midware,1}
 
+const empty_stack = Array(Midware,0)
+
+type MeddleRequest{R}
+    req::R
+    state::Dict
+    stack::MidwareStack
+    stack_pos::Int
+end
+MeddleRequest{R}(req::R) = MeddleRequest{R}(req,Dict{Symbol,Any}(),Meddle.empty_stack,0)
+
+immutable MeddleResponse{R}
+    res::R
+    state::Dict
+end
+MeddleResponse{R}(res::R) = MeddleResponse(res,Dict{Symbol,Any}())
+
 # `DefaultHeaders` writes the `Server` header on the `Response`
 #
 # This would be good as one of the first items in your stack
 # because it does not depend on any other midware, and ensures
 # that any `Response` sent will include the defaults.
 #
-DefaultHeaders = Midware() do req::MeddleRequest, res::Response
-    res.headers["Server"] = string(res.headers["Server"], " Meddle/$MEDDLE_VERSION")
-    req, res
+DefaultHeaders = Midware() do req::MeddleRequest, res::MeddleResponse
+    res.res.headers["Server"] = string(res.res.headers["Server"], " Meddle/$MEDDLE_VERSION")
+    pass(req, res)
 end
 
 # URLDecoder
@@ -83,13 +95,14 @@ end
 # 
 # Should be pretty far forward in the stack, makes URLs and URL strings usable.
 #
-URLDecoder = Midware() do req::MeddleRequest, res::Response
+URLDecoder = Midware() do req::MeddleRequest, res::MeddleResponse
     if contains(get(req.state, :url_query, ""), '=')
         req.state[:url_params] = parsequerystring(req.state[:url_query])
     end
-    req.state[:resource] = decodeURI(req.http_req.resource)
-    req, res
+    req.state[:resource] = decodeURI(req.req.resource)
+    pass(req, res)
 end
+
 
 # `CookieDecoder` builds `req.state[:cookies]` from `req.headers`.
 #
@@ -97,16 +110,24 @@ end
 # This should come fairly early in your stack,
 # before anything that needs to use cookies.
 #
-CookieDecoder = Midware() do req::MeddleRequest, res::Response
+Cookies = Midware() do req::MeddleRequest, res::MeddleResponse
     cookies = Dict()
-    if has(req.http_req.headers, "Cookie")
-        for pair in split(req.http_req.headers["Cookie"],"; ")
-            kv = split(pair,"=")
-            cookies[symbol(kv[1])] = kv[2]
+    if haskey(req.req.headers, "Cookie")
+        for pair in split(req.req.headers["Cookie"],"; ")
+            kv = split(pair,"=",2)
+            if length(kv) == 1
+                cookies[kv[1]] = ""
+            else
+                cookies[kv[1]] = kv[2]
+            end
         end
     end
     req.state[:cookies] = cookies
-    req, res
+    req,res = pass(req, res)
+    if haskey(res.state,:cookies)
+        res.res.headers["Set-Cookie"] = join(["$k=$v" for (k,v) in res.state[:cookies]],",")
+    end
+    req,res
 end
 
 # `BodyDecoder` builds `req.state[:data]` from `req.data`.
@@ -115,11 +136,11 @@ end
 # This should come fairly early in your stack,
 # before anything that needs to use POST data.
 #
-BodyDecoder = Midware() do req::MeddleRequest, res::Response
-    if contains(req.http_req.data,'=') 
-        req.state[:data] = parsequerystring(req.http_req.data)
+BodyDecoder = Midware() do req::MeddleRequest, res::MeddleResponse
+    if contains(req.req.data,'=') 
+        req.state[:data] = parsequerystring(req.req.data)
     end
-    req, res
+    pass(req, res)
 end
 
 # `FileServer` returns a `Midware` to serve files in `root`
@@ -129,23 +150,34 @@ end
 # If a file is found, it short-circuts and responds.
 #
 
+mime_map = [
+    ".js" => "application/javascript",
+    ".css" => "text/css",
+    ".png" => "image/png",
+    ".jpeg" => "image/jpeg",
+    ".jpg" => "image/jpeg",
+    ".htm" => "text/html",
+    ".html" => "test/html"
+]
+
 path_in_dir(p::String, d::String) = length(p) > length(d) && p[1:length(d)] == d
 
 function FileServer(root::String)
-    Midware() do req::MeddleRequest, res::Response
+    Midware() do req::MeddleRequest, res::MeddleResponse
         m = match(r"^/+(.*)$", req.state[:resource])
         if m != nothing
             path = normpath(root, m.captures[1])
             # protect against dir-escaping
             if !path_in_dir(path, root)
-                return respond(req, Response(400)) # Bad Request
+                return req, MeddleResponse(Response(400)) # Bad Request
             end
             if isfile(path)
-                res.data = readall(path)
-                return respond(req, res)
+                res.res.headers["Content-Type"] = get(mime_map,splitext(path)[2],"text/plain")*"; charset=utf-8"
+                res.res.data = readall(path)
+                return req, res
             end
         end
-        req, res
+        pass(req, res)
     end
 end
 
@@ -154,12 +186,20 @@ end
 # This is useful as the last thing in your stack
 # to handle all the "no idea what to do" requests.
 #
-NotFound = Midware() do req::MeddleRequest, res::Response
-    respond(req, Response(404))
+NotFound = Midware() do req::MeddleRequest, res::MeddleResponse
+    req, MeddleResponse(Response(404))
 end
 
 function middleware(midware...)
     Midware[typeof(m) == Function ? m() : m::Midware for m in midware]
+end
+
+function pass(req::MeddleRequest,res::MeddleResponse) 
+    if !done(req.stack,req.stack_pos)
+        (mid, req.stack_pos) = next(req.stack,req.stack_pos)
+        req, res = mid.handler(req,res)
+    end
+    req, res
 end
 
 # `handle` method runs the `req, res` through each `Midware` in `stack`.
@@ -167,21 +207,20 @@ end
 # Stops and returns the response when complete ( `res.finished == true` ).
 # Usually called in `HttpHandler.handle`
 #
-function handle(stack::MidwareStack, req::MeddleRequest, res::Response)
-    for mid in stack
-        # TODO: check these and throw useful error for bad returns
-        req, res = mid.handler(req, res)
-        if res.finished
-            return res
-        end
-    end
-    res
-end
-
-# `respond` is syntactic sugar for setting `res.finished` to true.
-function respond(req::MeddleRequest, res::Response)
-    res.finished = true
+function handle(stack::MidwareStack, req::MeddleRequest, res::MeddleResponse)
+    old_stack = req.stack
+    old_stack_pos = req.stack_pos
+    req.stack = stack
+    req.stack_pos = start(stack)
+    req, res = pass(req,res)
+    req.stack_pos = old_stack_pos
+    req.stack = old_stack
     req, res
 end
+
+# Convenience Functions
+
+export set_status
+set_status(res::MeddleResponse,status) = res.res.status = status
 
 end # module Meddle
